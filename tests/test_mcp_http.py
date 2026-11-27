@@ -109,3 +109,47 @@ def test_read_article_tool_rejects_ssrf_via_mcp_call() -> None:
         parsed = json.loads(content_text)
         assert parsed["ok"] is False
         assert "Blocked by security policy" in parsed["error"]
+
+
+def test_streamable_http_cors_get_405_missing_accept_and_trailing_slash() -> None:
+    _, app, _ = create_server(Settings(mcp_path_secret="sec-xyz", rate_limit_rpm=100))
+
+    with TestClient(app) as client:
+        # 1. CORS preflight OPTIONS succeeds with Access-Control-Allow-Origin
+        opt = client.options(
+            "/mcp/sec-xyz",
+            headers={
+                "Origin": "https://gemini.google.com",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type,accept,mcp-protocol-version",
+            },
+        )
+        assert opt.status_code == 200
+        assert opt.headers.get("access-control-allow-origin") == "*"
+
+        # 2. GET SSE probe immediately returns 405 Method Not Allowed (never hangs)
+        get_sse = client.get(
+            "/mcp/sec-xyz",
+            headers={"Accept": "text/event-stream", "Origin": "https://gemini.google.com"},
+        )
+        assert get_sse.status_code == 405
+        assert "POST" in get_sse.headers.get("allow", "")
+        assert get_sse.headers.get("access-control-allow-origin") == "*"
+
+        # 3. POST without Accept header succeeds (200)
+        no_accept = client.post(
+            "/mcp/sec-xyz",
+            headers={"Content-Type": "application/json"},
+            json={"jsonrpc": "2.0", "id": 10, "method": "tools/list", "params": {}},
+        )
+        assert no_accept.status_code == 200
+        assert len(no_accept.json()["result"]["tools"]) == 6
+
+        # 4. POST with trailing slash succeeds (200)
+        trailing = client.post(
+            "/mcp/sec-xyz/",
+            headers=_mcp_headers(),
+            json={"jsonrpc": "2.0", "id": 11, "method": "tools/list", "params": {}},
+        )
+        assert trailing.status_code == 200
+        assert len(trailing.json()["result"]["tools"]) == 6
