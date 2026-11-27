@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: gemini-news-mcp
+    runtime: docker
+    plan: free
+    region: singapore
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: "8000"
+      - key: MCP_PATH_SECRET
+        sync: false
+      - key: CACHE_TTL_SECONDS
+        value: "600"
+      - key: RATE_LIMIT_RPM
+        value: "60"
+      - key: SOURCE_TIMEOUT_SECONDS
+        value: "7.0"
