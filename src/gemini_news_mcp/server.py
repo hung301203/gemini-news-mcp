@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections import defaultdict, deque
 from typing import Any
 
 import uvicorn
 from mcp.server.mcpserver import MCPServer
-from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse
+
+logger = logging.getLogger("gemini_news_mcp")
 
 from gemini_news_mcp import __version__
 from gemini_news_mcp.cache import TTLCache
@@ -50,24 +53,96 @@ class SlidingWindowRateLimiter:
         return True, 0
 
 
-class RateLimitMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app: Any, limiter: SlidingWindowRateLimiter) -> None:
-        super().__init__(app)
-        self._limiter = limiter
+class MCPCompatAndRateLimitMiddleware:
+    """Pure-ASGI middleware for MCP Streamable HTTP compatibility, redacted request logging, and rate limiting."""
 
-    async def dispatch(self, request: Request, call_next: Any) -> Response:
-        if request.url.path in {"/health", "/"}:
-            return await call_next(request)
-        forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-        client_ip = forwarded or (request.client.host if request.client else "unknown")
-        allowed, retry_after = self._limiter.allow(client_ip)
-        if not allowed:
-            return JSONResponse(
-                {"error": "Rate limit exceeded", "retry_after_seconds": retry_after},
-                status_code=429,
-                headers={"Retry-After": str(retry_after)},
-            )
-        return await call_next(request)
+    def __init__(
+        self,
+        app: Any,
+        *,
+        limiter: SlidingWindowRateLimiter,
+        mcp_path: str,
+        secret: str = "",
+    ) -> None:
+        self.app = app
+        self._limiter = limiter
+        self._mcp_path = mcp_path.rstrip("/") or "/mcp"
+        self._secret = secret
+
+    def _redact_path(self, path: str) -> str:
+        if self._secret and self._secret in path:
+            return path.replace(self._secret, "<secret>")
+        return path
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        method = str(scope.get("method", "GET")).upper()
+        raw_path = str(scope.get("path", "/"))
+        norm_path = raw_path.rstrip("/") or "/"
+        headers_list: list[tuple[bytes, bytes]] = list(scope.get("headers") or [])
+        header_map = {k.lower(): v.decode("latin-1") for k, v in headers_list}
+
+        # Rate limit everything except health/root/preflight
+        if norm_path not in {"/health", "/"} and method != "OPTIONS":
+            forwarded = header_map.get(b"x-forwarded-for", "").split(",")[0].strip()
+            client = scope.get("client")
+            client_ip = forwarded or (client[0] if client else "unknown")
+            allowed, retry_after = self._limiter.allow(client_ip)
+            if not allowed:
+                logger.info("%s %s -> 429 (rate-limited)", method, self._redact_path(raw_path))
+                resp = JSONResponse(
+                    {"error": "Rate limit exceeded", "retry_after_seconds": retry_after},
+                    status_code=429,
+                    headers={"Retry-After": str(retry_after)},
+                )
+                await resp(scope, receive, send)
+                return
+
+        if norm_path == self._mcp_path:
+            # Normalize trailing slash on MCP route
+            if raw_path != self._mcp_path:
+                scope["path"] = self._mcp_path
+                scope["raw_path"] = self._mcp_path.encode("utf-8")
+
+            # Stateless JSON-only Streamable HTTP servers must reject GET SSE probes cleanly with 405
+            # instead of holding open an infinite empty SSE stream that stalls web clients.
+            if method == "GET":
+                logger.info("GET %s -> 405 (stateless JSON-only MCP)", self._redact_path(raw_path))
+                resp = JSONResponse(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {
+                            "code": -32600,
+                            "message": "Method Not Allowed: stateless Streamable HTTP server accepts POST only.",
+                        },
+                    },
+                    status_code=405,
+                    headers={"Allow": "POST, OPTIONS"},
+                )
+                await resp(scope, receive, send)
+                return
+
+            # Ensure POST requests lacking an Accept header do not fail with 406
+            if method == "POST" and not header_map.get(b"accept", "").strip():
+                headers_list.append((b"accept", b"application/json, text/event-stream"))
+                scope["headers"] = headers_list
+
+        status_holder = {"status": 500}
+
+        async def logging_send(message: dict[str, Any]) -> None:
+            if message.get("type") == "http.response.start":
+                status_holder["status"] = int(message.get("status", 500))
+            await send(message)
+
+        try:
+            await self.app(scope, receive, logging_send)
+        finally:
+            if norm_path != "/health":
+                logger.info("%s %s -> %s", method, self._redact_path(raw_path), status_holder["status"])
 
 
 def _format_json(payload: dict[str, Any]) -> str:
@@ -470,7 +545,19 @@ def create_server(settings: Settings | None = None) -> tuple[MCPServer, Any, TTL
         host="0.0.0.0",
     )
     limiter = SlidingWindowRateLimiter(max_requests_per_minute=cfg.rate_limit_rpm)
-    starlette_app.add_middleware(RateLimitMiddleware, limiter=limiter)
+    starlette_app.add_middleware(
+        MCPCompatAndRateLimitMiddleware,
+        limiter=limiter,
+        mcp_path=cfg.mcp_route_path,
+        secret=cfg.mcp_path_secret,
+    )
+    starlette_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+        allow_headers=["*"],
+        expose_headers=["Mcp-Session-Id", "Mcp-Protocol-Version"],
+    )
 
     return mcp, starlette_app, cache
 
